@@ -1,64 +1,96 @@
 module ActiveRecordLaxIncludes
-  module Preloader
-    def self.included(base)
-      base.class_eval do
-        alias_method :records_by_reflection_default, :records_by_reflection
-        alias_method :records_by_reflection, :records_by_reflection_with_lax_include
+  def lax_includes
+    Thread.current[:active_record_lax_includes_enabled] = true
+    yield
+  ensure
+    Thread.current[:active_record_lax_includes_enabled] = false
+  end
 
-        alias_method :preload_hash_default, :preload_hash
-        alias_method :preload_hash, :preload_hash_with_lax_include
-      end
+  def lax_includes_enabled?
+    result = Thread.current[:active_record_lax_includes_enabled]
+    if result.nil?
+      result = Rails.configuration.respond_to?(:active_record_lax_includes_enabled) &&
+                  Rails.configuration.active_record_lax_includes_enabled
     end
+    result
+  end
 
-    def preload_hash_with_lax_include(association)
-      if lax_includes_enabled?
-        association.each do |parent, child|
-          ActiveRecord::Associations::Preloader.new(records, parent, options).run
-          associated_records = filtered_records_by_reflection(parent).map { |record| record.send(parent) }.flatten
-          ActiveRecord::Associations::Preloader.new(associated_records, child).run
+  module Base
+    def association(name)
+      association = association_instance_get(name)
+
+      if association.nil?
+        if reflection = self.class._reflect_on_association(name)
+          association = reflection.association_class.new(self, reflection)
+          association_instance_set(name, association)
+        elsif !ActiveRecord.lax_includes_enabled?
+          raise ActiveRecord::AssociationNotFoundError.new(self, name)
         end
-      else
-        preload_hash_default(association)
       end
-    end
 
-    def records_by_reflection_with_lax_include(association)
-      if lax_includes_enabled?
-        filtered_records_by_reflection(association).group_by do |record|
-          record.class.reflections[association]
-        end
-      else
-        records_by_reflection_default(association)
-      end
-    end
-
-    def filtered_records_by_reflection(association)
-      records.select do |record|
-        record.class.reflections[association].present?
-      end
-    end
-
-    def lax_includes_enabled?
-      result = Thread.current[:active_record_lax_includes_enabled]
-      if result.nil?
-        result = Rails.configuration.respond_to?(:active_record_lax_includes_enabled) &&
-                    Rails.configuration.active_record_lax_includes_enabled
-      end
-      result
+      association
     end
   end
 
-  module BaseHelper
-    def lax_includes
-      Thread.current[:active_record_lax_includes_enabled] = true
-      yield
-    ensure
-      Thread.current[:active_record_lax_includes_enabled] = false
+  module Preloader
+    private
+
+    def preloaders_on(association, records, scope, options = {})
+      case association
+      when Hash
+        preloaders_for_hash(association, records, scope, options)
+      when Symbol
+        preloaders_for_one(association, records, scope, options)
+      when String
+        preloaders_for_one(association.to_sym, records, scope, options)
+      else
+        raise ArgumentError, "#{association.inspect} was not recognised for preload"
+      end
+    end
+
+    def preloaders_for_hash(association, records, scope, options = {})
+      association.flat_map { |parent, child|
+        loaders = preloaders_for_one parent, records, scope
+        polymorphic = options[:polymorphic] || loaders.any?{ |l| l.reflection.polymorphic? }
+
+        recs = loaders.flat_map(&:preloaded_records).uniq
+        loaders.concat Array.wrap(child).flat_map { |assoc|
+          preloaders_on assoc, recs, scope, polymorphic: polymorphic
+        }
+        loaders
+      }
+    end
+
+    def preloaders_for_one(association, records, scope, options = {})
+      grouped = grouped_records(association, records)
+      if ActiveRecord.lax_includes_enabled? && records.any? && grouped.none? && !options[:polymorphic]
+        raise ActiveRecord::AssociationNotFoundError.new(records.first.class, association)
+      end
+
+      grouped.flat_map do |reflection, klasses|
+        klasses.map do |rhs_klass, rs|
+          loader = preloader_for(reflection, rs, rhs_klass).new(rhs_klass, rs, reflection, scope)
+          loader.run self
+          loader
+        end
+      end
+    end
+
+    def grouped_records(association, records)
+      h = {}
+      records.each do |record|
+        if record && assoc = record.association(association)
+          klasses = h[assoc.reflection] ||= {}
+          (klasses[assoc.klass] ||= []) << record
+        end
+      end
+      h
     end
   end
 end
 
 require 'active_record'
 
-ActiveRecord::Associations::Preloader.send(:include, ActiveRecordLaxIncludes::Preloader)
-ActiveRecord.send(:extend, ActiveRecordLaxIncludes::BaseHelper)
+ActiveRecord.send(:extend, ActiveRecordLaxIncludes)
+ActiveRecord::Base.send(:prepend, ActiveRecordLaxIncludes::Base)
+ActiveRecord::Associations::Preloader.send(:prepend, ActiveRecordLaxIncludes::Preloader)
