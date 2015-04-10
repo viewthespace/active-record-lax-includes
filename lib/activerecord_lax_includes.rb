@@ -50,7 +50,7 @@ module ActiveRecordLaxIncludes
 
     def preloaders_for_hash(association, records, scope, options = {})
       association.flat_map { |parent, child|
-        loaders = preloaders_for_one parent, records, scope
+        loaders = preloaders_for_one parent, records, scope, options
         polymorphic = options[:polymorphic] || loaders.any?{ |l| l.reflection.polymorphic? }
 
         recs = loaders.flat_map(&:preloaded_records).uniq
